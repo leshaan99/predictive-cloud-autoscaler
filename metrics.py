@@ -1,23 +1,70 @@
+"""
+metrics.py - Multi-Metric Fusion Data Fetcher
+==============================================
+Fetches per-service metrics from Prometheus every 15 seconds.
+Supports Frontend and Backend ASGs independently.
+"""
+
 import requests
+from datetime import datetime
 
-PROMETHEUS_URL = 'http://localhost:9090/api/v1/query'
+PROMETHEUS_URL = "http://localhost:9090/api/v1/query"
 
-def get_fused_metrics():
-    """Fetches high-frequency metrics for Multi-Metric Fusion."""
-    # Fetch CPU Usage (Average across ASG)
-    cpu_query = 'avg(rate(node_cpu_seconds_total{mode!="idle"}[1m])) * 100'
-    
-    # Fetch Network Traffic as a proxy for Request Rate (since we don't have a web app deployed yet)
-    net_query = 'sum(rate(node_network_receive_bytes_total[1m]))' 
-    
+
+def _query(promql):
+    """Sends a PromQL query and returns the float result."""
     try:
-        cpu_res = requests.get(PROMETHEUS_URL, params={'query': cpu_query}, timeout=5).json()
-        net_res = requests.get(PROMETHEUS_URL, params={'query': net_query}, timeout=5).json()
-        
-        cpu_val = float(cpu_res['data']['result'][0]['value'][1]) if cpu_res['data']['result'] else 0.0
-        net_val = float(net_res['data']['result'][0]['value'][1]) if net_res['data']['result'] else 0.0
-        
-        return {"cpu": round(cpu_val, 2), "network": round(net_val, 2)}
+        response = requests.get(
+            PROMETHEUS_URL,
+            params={"query": promql},
+            timeout=5
+        )
+        response.raise_for_status()
+        results = response.json()["data"]["result"]
+        if results:
+            return round(float(results[0]["value"][1]), 4)
+        return 0.0
     except Exception as e:
-        print(f"Metrics fetch error: {e}")
-        return {"cpu": 0.0, "network": 0.0}
+        print(f"[Metrics] Query error: {e}")
+        return 0.0
+
+
+def get_service_metrics(service: str) -> dict:
+    """
+    Fetches CPU, network, and memory for a specific service label.
+    'service' matches the relabel value set in prometheus.yml:
+      'frontend' or 'backend'
+    """
+    cpu = _query(
+        f'avg(rate(node_cpu_seconds_total{{service="{service}",mode!="idle"}}[1m])) * 100'
+    )
+    network = _query(
+        f'sum(rate(node_network_receive_bytes_total{{service="{service}"}}[1m]))'
+    )
+    memory = _query(
+        f'(1 - (avg(node_memory_MemAvailable_bytes{{service="{service}"}}) '
+        f'/ avg(node_memory_MemTotal_bytes{{service="{service}"}}))) * 100'
+    )
+
+    return {
+        "service":   service,
+        "cpu":       cpu,
+        "network":   network,
+        "memory":    memory,
+        "timestamp": datetime.now().strftime("%H:%M:%S")
+    }
+
+
+def get_all_metrics() -> dict:
+    """Fetches metrics for all services in one call."""
+    return {
+        "frontend": get_service_metrics("frontend"),
+        "backend":  get_service_metrics("backend"),
+    }
+
+
+if __name__ == "__main__":
+    print("Testing Prometheus connection...")
+    data = get_all_metrics()
+    for svc, m in data.items():
+        print(f"[{svc}] CPU: {m['cpu']}% | Network: {m['network']} B/s | Memory: {m['memory']}%")
