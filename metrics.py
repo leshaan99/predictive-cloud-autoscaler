@@ -32,15 +32,17 @@ def _query(promql):
 def get_service_metrics(service: str) -> dict:
     """
     Fetches CPU, network, and memory for a specific service label.
-    'service' matches the relabel value set in prometheus.yml:
-      'frontend' or 'backend'
+    Uses correct PromQL: 100 - idle = actual CPU usage
     """
+    # FIXED: correct CPU query using idle mode subtraction
     cpu = _query(
-        f'avg(rate(node_cpu_seconds_total{{service="{service}",mode!="idle"}}[1m])) * 100'
+        f'100 - (avg by (instance) (rate(node_cpu_seconds_total{{service="{service}",mode="idle"}}[1m])) * 100)'
     )
+
     network = _query(
         f'sum(rate(node_network_receive_bytes_total{{service="{service}"}}[1m]))'
     )
+
     memory = _query(
         f'(1 - (avg(node_memory_MemAvailable_bytes{{service="{service}"}}) '
         f'/ avg(node_memory_MemTotal_bytes{{service="{service}"}}))) * 100'

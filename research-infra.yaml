@@ -1,0 +1,481 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "ML-Driven Autoscaling - 2-Service Waterfall Architecture",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Description": "Select VPC"
+    },
+    "SubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Select public subnets (at least 2)"
+    },
+    "KeyPairName": {
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "Description": "Name of an existing EC2 KeyPair"
+    }
+  },
+  "Resources": {
+    "MonitorRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "ML-Monitor-Role",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
+          "arn:aws:iam::aws:policy/AutoScalingFullAccess",
+          "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess"
+        ]
+      }
+    },
+    "MonitorInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "MonitorRole"
+          }
+        ]
+      }
+    },
+    "AppRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "ML-App-Role",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+          "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+        ]
+      }
+    },
+    "AppInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "AppRole"
+          }
+        ]
+      }
+    },
+    "ALBSG": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Allow HTTP to ALB",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "AppSG": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Allow ALB, Prometheus, SSH traffic",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "SourceSecurityGroupId": {
+              "Ref": "ALBSG"
+            }
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 9100,
+            "ToPort": 9100,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 9090,
+            "ToPort": 9090,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 8000,
+            "ToPort": 8000,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "AppSGSelfIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "AppSG"
+        },
+        "IpProtocol": "-1",
+        "SourceSecurityGroupId": {
+          "Ref": "AppSG"
+        }
+      }
+    },
+    "FrontendALB": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Name": "ML-Frontend-ALB",
+        "Subnets": {
+          "Ref": "SubnetIds"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "ALBSG"
+          }
+        ]
+      }
+    },
+    "FrontendTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": "ML-Frontend-TG",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Protocol": "HTTP",
+        "Port": 80,
+        "TargetType": "instance",
+        "HealthCheckPath": "/",
+        "HealthCheckIntervalSeconds": 30
+      }
+    },
+    "FrontendListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "FrontendALB"
+        },
+        "Port": 80,
+        "Protocol": "HTTP",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "FrontendTargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "FrontendLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": "ML-Frontend-Template",
+        "LaunchTemplateData": {
+          "ImageId": "ami-0b41630d96e91daa9",
+          "InstanceType": "t3.micro",
+          "KeyName": {
+            "Ref": "KeyPairName"
+          },
+          "IamInstanceProfile": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "AppInstanceProfile",
+                "Arn"
+              ]
+            }
+          },
+          "SecurityGroupIds": [
+            {
+              "Ref": "AppSG"
+            }
+          ],
+          "UserData": "IyEvYmluL2Jhc2gKc2V0IC1lCmV4ZWMgPiAvdmFyL2xvZy91c2VyZGF0YS5sb2cgMj4mMQoKY2QgL3RtcAp3Z2V0IC1xIGh0dHBzOi8vZ2l0aHViLmNvbS9wcm9tZXRoZXVzL25vZGVfZXhwb3J0ZXIvcmVsZWFzZXMvZG93bmxvYWQvdjEuNy4wL25vZGVfZXhwb3J0ZXItMS43LjAubGludXgtYW1kNjQudGFyLmd6CnRhciAteGYgbm9kZV9leHBvcnRlci0xLjcuMC5saW51eC1hbWQ2NC50YXIuZ3oKbXYgbm9kZV9leHBvcnRlci0xLjcuMC5saW51eC1hbWQ2NC9ub2RlX2V4cG9ydGVyIC91c3IvbG9jYWwvYmluLwoKY2F0ID4gL2V0Yy9zeXN0ZW1kL3N5c3RlbS9ub2RlLWV4cG9ydGVyLnNlcnZpY2UgPDwgJ0VPRicKW1VuaXRdCkRlc2NyaXB0aW9uPU5vZGUgRXhwb3J0ZXIKQWZ0ZXI9bmV0d29yay50YXJnZXQKCltTZXJ2aWNlXQpFeGVjU3RhcnQ9L3Vzci9sb2NhbC9iaW4vbm9kZV9leHBvcnRlcgpSZXN0YXJ0PWFsd2F5cwpSZXN0YXJ0U2VjPTMKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApFT0YKCnN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN5c3RlbWN0bCBlbmFibGUgbm9kZS1leHBvcnRlcgpzeXN0ZW1jdGwgc3RhcnQgbm9kZS1leHBvcnRlcgoKZG5mIGluc3RhbGwgLXkgcHl0aG9uMwoKY2F0ID4gL2hvbWUvZWMyLXVzZXIvYXBwLnB5IDw8ICdFT0YnCmZyb20gaHR0cC5zZXJ2ZXIgaW1wb3J0IEhUVFBTZXJ2ZXIsIEJhc2VIVFRQUmVxdWVzdEhhbmRsZXIKY2xhc3MgSGFuZGxlcihCYXNlSFRUUFJlcXVlc3RIYW5kbGVyKToKICAgIGRlZiBkb19HRVQoc2VsZik6CiAgICAgICAgc2VsZi5zZW5kX3Jlc3BvbnNlKDIwMCkKICAgICAgICBzZWxmLmVuZF9oZWFkZXJzKCkKICAgICAgICBzZWxmLndmaWxlLndyaXRlKGInRnJvbnRlbmQgT0snKQogICAgZGVmIGxvZ19tZXNzYWdlKHNlbGYsIGZvcm1hdCwgKmFyZ3MpOiBwYXNzCkhUVFBTZXJ2ZXIoKCcnLCA4MCksIEhhbmRsZXIpLnNlcnZlX2ZvcmV2ZXIoKQpFT0YKCmNhdCA+IC9ldGMvc3lzdGVtZC9zeXN0ZW0vZnJvbnRlbmQtYXBwLnNlcnZpY2UgPDwgJ0VPRicKW1VuaXRdCkRlc2NyaXB0aW9uPUZyb250ZW5kIEFwcApBZnRlcj1uZXR3b3JrLnRhcmdldAoKW1NlcnZpY2VdCkV4ZWNTdGFydD0vdXNyL2Jpbi9weXRob24zIC9ob21lL2VjMi11c2VyL2FwcC5weQpSZXN0YXJ0PWFsd2F5cwpSZXN0YXJ0U2VjPTMKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApFT0YKCnN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN5c3RlbWN0bCBlbmFibGUgZnJvbnRlbmQtYXBwCnN5c3RlbWN0bCBzdGFydCBmcm9udGVuZC1hcHAKZWNobyAiRnJvbnRlbmQgVXNlckRhdGEgZG9uZSIK",
+          "TagSpecifications": [
+            {
+              "ResourceType": "instance",
+              "Tags": [
+                {
+                  "Key": "Name",
+                  "Value": "ML-Frontend"
+                },
+                {
+                  "Key": "Service",
+                  "Value": "frontend"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "FrontendASG": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "AutoScalingGroupName": "ML-Frontend-ASG",
+        "MinSize": "1",
+        "MaxSize": "10",
+        "DesiredCapacity": "2",
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "FrontendLaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "FrontendLaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        },
+        "VPCZoneIdentifier": {
+          "Ref": "SubnetIds"
+        },
+        "TargetGroupARNs": [
+          {
+            "Ref": "FrontendTargetGroup"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "ML-Frontend",
+            "PropagateAtLaunch": true
+          },
+          {
+            "Key": "Service",
+            "Value": "frontend",
+            "PropagateAtLaunch": true
+          }
+        ]
+      }
+    },
+    "BackendALB": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Name": "ML-Backend-ALB",
+        "Subnets": {
+          "Ref": "SubnetIds"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "ALBSG"
+          }
+        ]
+      }
+    },
+    "BackendTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": "ML-Backend-TG",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Protocol": "HTTP",
+        "Port": 80,
+        "TargetType": "instance",
+        "HealthCheckPath": "/",
+        "HealthCheckIntervalSeconds": 30
+      }
+    },
+    "BackendListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "BackendALB"
+        },
+        "Port": 80,
+        "Protocol": "HTTP",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "BackendTargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "BackendLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": "ML-Backend-Template",
+        "LaunchTemplateData": {
+          "ImageId": "ami-0b41630d96e91daa9",
+          "InstanceType": "t3.micro",
+          "KeyName": {
+            "Ref": "KeyPairName"
+          },
+          "IamInstanceProfile": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "AppInstanceProfile",
+                "Arn"
+              ]
+            }
+          },
+          "SecurityGroupIds": [
+            {
+              "Ref": "AppSG"
+            }
+          ],
+          "UserData": "IyEvYmluL2Jhc2gKc2V0IC1lCmV4ZWMgPiAvdmFyL2xvZy91c2VyZGF0YS5sb2cgMj4mMQoKY2QgL3RtcAp3Z2V0IC1xIGh0dHBzOi8vZ2l0aHViLmNvbS9wcm9tZXRoZXVzL25vZGVfZXhwb3J0ZXIvcmVsZWFzZXMvZG93bmxvYWQvdjEuNy4wL25vZGVfZXhwb3J0ZXItMS43LjAubGludXgtYW1kNjQudGFyLmd6CnRhciAteGYgbm9kZV9leHBvcnRlci0xLjcuMC5saW51eC1hbWQ2NC50YXIuZ3oKbXYgbm9kZV9leHBvcnRlci0xLjcuMC5saW51eC1hbWQ2NC9ub2RlX2V4cG9ydGVyIC91c3IvbG9jYWwvYmluLwoKY2F0ID4gL2V0Yy9zeXN0ZW1kL3N5c3RlbS9ub2RlLWV4cG9ydGVyLnNlcnZpY2UgPDwgJ0VPRicKW1VuaXRdCkRlc2NyaXB0aW9uPU5vZGUgRXhwb3J0ZXIKQWZ0ZXI9bmV0d29yay50YXJnZXQKCltTZXJ2aWNlXQpFeGVjU3RhcnQ9L3Vzci9sb2NhbC9iaW4vbm9kZV9leHBvcnRlcgpSZXN0YXJ0PWFsd2F5cwpSZXN0YXJ0U2VjPTMKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApFT0YKCnN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN5c3RlbWN0bCBlbmFibGUgbm9kZS1leHBvcnRlcgpzeXN0ZW1jdGwgc3RhcnQgbm9kZS1leHBvcnRlcgoKZG5mIGluc3RhbGwgLXkgcHl0aG9uMwoKY2F0ID4gL2hvbWUvZWMyLXVzZXIvYXBwLnB5IDw8ICdFT0YnCmZyb20gaHR0cC5zZXJ2ZXIgaW1wb3J0IEhUVFBTZXJ2ZXIsIEJhc2VIVFRQUmVxdWVzdEhhbmRsZXIKY2xhc3MgSGFuZGxlcihCYXNlSFRUUFJlcXVlc3RIYW5kbGVyKToKICAgIGRlZiBkb19HRVQoc2VsZik6CiAgICAgICAgc2VsZi5zZW5kX3Jlc3BvbnNlKDIwMCkKICAgICAgICBzZWxmLmVuZF9oZWFkZXJzKCkKICAgICAgICBzZWxmLndmaWxlLndyaXRlKGInQmFja2VuZCBPSycpCiAgICBkZWYgbG9nX21lc3NhZ2Uoc2VsZiwgZm9ybWF0LCAqYXJncyk6IHBhc3MKSFRUUFNlcnZlcigoJycsIDgwKSwgSGFuZGxlcikuc2VydmVfZm9yZXZlcigpCkVPRgoKY2F0ID4gL2V0Yy9zeXN0ZW1kL3N5c3RlbS9iYWNrZW5kLWFwcC5zZXJ2aWNlIDw8ICdFT0YnCltVbml0XQpEZXNjcmlwdGlvbj1CYWNrZW5kIEFwcApBZnRlcj1uZXR3b3JrLnRhcmdldAoKW1NlcnZpY2VdCkV4ZWNTdGFydD0vdXNyL2Jpbi9weXRob24zIC9ob21lL2VjMi11c2VyL2FwcC5weQpSZXN0YXJ0PWFsd2F5cwpSZXN0YXJ0U2VjPTMKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApFT0YKCnN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN5c3RlbWN0bCBlbmFibGUgYmFja2VuZC1hcHAKc3lzdGVtY3RsIHN0YXJ0IGJhY2tlbmQtYXBwCmVjaG8gIkJhY2tlbmQgVXNlckRhdGEgZG9uZSIK",
+          "TagSpecifications": [
+            {
+              "ResourceType": "instance",
+              "Tags": [
+                {
+                  "Key": "Name",
+                  "Value": "ML-Backend"
+                },
+                {
+                  "Key": "Service",
+                  "Value": "backend"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "BackendASG": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "AutoScalingGroupName": "ML-Backend-ASG",
+        "MinSize": "1",
+        "MaxSize": "10",
+        "DesiredCapacity": "2",
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "BackendLaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "BackendLaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        },
+        "VPCZoneIdentifier": {
+          "Ref": "SubnetIds"
+        },
+        "TargetGroupARNs": [
+          {
+            "Ref": "BackendTargetGroup"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "ML-Backend",
+            "PropagateAtLaunch": true
+          },
+          {
+            "Key": "Service",
+            "Value": "backend",
+            "PropagateAtLaunch": true
+          }
+        ]
+      }
+    },
+    "ManagementNode": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "InstanceType": "t3.micro",
+        "ImageId": "ami-0b41630d96e91daa9",
+        "KeyName": {
+          "Ref": "KeyPairName"
+        },
+        "IamInstanceProfile": {
+          "Ref": "MonitorInstanceProfile"
+        },
+        "SecurityGroupIds": [
+          {
+            "Ref": "AppSG"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "ML-Management-Node"
+          }
+        ],
+        "UserData": "IyEvYmluL2Jhc2gKc2V0IC1lCmV4ZWMgPiAvdmFyL2xvZy91c2VyZGF0YS5sb2cgMj4mMQoKIyBQcm9tZXRoZXVzCmNkIC9ob21lL2VjMi11c2VyCndnZXQgLXEgaHR0cHM6Ly9naXRodWIuY29tL3Byb21ldGhldXMvcHJvbWV0aGV1cy9yZWxlYXNlcy9kb3dubG9hZC92Mi40OC4xL3Byb21ldGhldXMtMi40OC4xLmxpbnV4LWFtZDY0LnRhci5negp0YXIgLXhmIHByb21ldGhldXMtMi40OC4xLmxpbnV4LWFtZDY0LnRhci5negptdiBwcm9tZXRoZXVzLTIuNDguMS5saW51eC1hbWQ2NCBwcm9tZXRoZXVzCm1rZGlyIC1wIC9ob21lL2VjMi11c2VyL3Byb21ldGhldXMvZGF0YQpjaG93biAtUiBlYzItdXNlcjplYzItdXNlciAvaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzCgpjYXQgPiAvaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzL3Byb21ldGhldXMueW1sIDw8ICdFT0YnCmdsb2JhbDoKICBzY3JhcGVfaW50ZXJ2YWw6IDE1cwogIGV2YWx1YXRpb25faW50ZXJ2YWw6IDE1cwoKc2NyYXBlX2NvbmZpZ3M6CiAgLSBqb2JfbmFtZTogJ2Zyb250ZW5kLWFzZycKICAgIGVjMl9zZF9jb25maWdzOgogICAgICAtIHJlZ2lvbjogbWUtY2VudHJhbC0xCiAgICAgICAgcG9ydDogOTEwMAogICAgcmVsYWJlbF9jb25maWdzOgogICAgICAtIHNvdXJjZV9sYWJlbHM6IFtfX21ldGFfZWMyX3RhZ19TZXJ2aWNlXQogICAgICAgIHJlZ2V4OiBmcm9udGVuZAogICAgICAgIGFjdGlvbjoga2VlcAogICAgICAtIHNvdXJjZV9sYWJlbHM6IFtfX21ldGFfZWMyX2luc3RhbmNlX2lkXQogICAgICAgIHRhcmdldF9sYWJlbDogaW5zdGFuY2VfaWQKICAgICAgLSByZXBsYWNlbWVudDogZnJvbnRlbmQKICAgICAgICB0YXJnZXRfbGFiZWw6IHNlcnZpY2UKCiAgLSBqb2JfbmFtZTogJ2JhY2tlbmQtYXNnJwogICAgZWMyX3NkX2NvbmZpZ3M6CiAgICAgIC0gcmVnaW9uOiBtZS1jZW50cmFsLTEKICAgICAgICBwb3J0OiA5MTAwCiAgICByZWxhYmVsX2NvbmZpZ3M6CiAgICAgIC0gc291cmNlX2xhYmVsczogW19fbWV0YV9lYzJfdGFnX1NlcnZpY2VdCiAgICAgICAgcmVnZXg6IGJhY2tlbmQKICAgICAgICBhY3Rpb246IGtlZXAKICAgICAgLSBzb3VyY2VfbGFiZWxzOiBbX19tZXRhX2VjMl9pbnN0YW5jZV9pZF0KICAgICAgICB0YXJnZXRfbGFiZWw6IGluc3RhbmNlX2lkCiAgICAgIC0gcmVwbGFjZW1lbnQ6IGJhY2tlbmQKICAgICAgICB0YXJnZXRfbGFiZWw6IHNlcnZpY2UKRU9GCgpjaG93biBlYzItdXNlcjplYzItdXNlciAvaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzL3Byb21ldGhldXMueW1sCgpjYXQgPiAvZXRjL3N5c3RlbWQvc3lzdGVtL3Byb21ldGhldXMuc2VydmljZSA8PCAnRU9GJwpbVW5pdF0KRGVzY3JpcHRpb249UHJvbWV0aGV1cwpBZnRlcj1uZXR3b3JrLnRhcmdldAoKW1NlcnZpY2VdClVzZXI9ZWMyLXVzZXIKV29ya2luZ0RpcmVjdG9yeT0vaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzCkV4ZWNTdGFydD0vaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzL3Byb21ldGhldXMgLS1jb25maWcuZmlsZT0vaG9tZS9lYzItdXNlci9wcm9tZXRoZXVzL3Byb21ldGhldXMueW1sIC0tc3RvcmFnZS50c2RiLnBhdGg9L2hvbWUvZWMyLXVzZXIvcHJvbWV0aGV1cy9kYXRhIC0td2ViLmVuYWJsZS1saWZlY3ljbGUKUmVzdGFydD1hbHdheXMKUmVzdGFydFNlYz01CgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQKRU9GCgpzeXN0ZW1jdGwgZGFlbW9uLXJlbG9hZApzeXN0ZW1jdGwgZW5hYmxlIHByb21ldGhldXMKc3lzdGVtY3RsIHN0YXJ0IHByb21ldGhldXMKCiMgTUwgQXV0b3NjYWxlcgpkbmYgaW5zdGFsbCAteSBnaXQgcHl0aG9uMy1waXAKCmNkIC9ob21lL2VjMi11c2VyCmdpdCBjbG9uZSBodHRwczovL2dpdGh1Yi5jb20vbGVzaGFhbjk5L3ByZWRpY3RpdmUtY2xvdWQtYXV0b3NjYWxlci5naXQgYXBwCmNob3duIC1SIGVjMi11c2VyOmVjMi11c2VyIC9ob21lL2VjMi11c2VyL2FwcAoKY2QgL2hvbWUvZWMyLXVzZXIvYXBwCnB5dGhvbjMgLW0gdmVudiB2ZW52CnNvdXJjZSB2ZW52L2Jpbi9hY3RpdmF0ZQpwaXAgaW5zdGFsbCAtciByZXF1aXJlbWVudHMudHh0Cgpta2RpciAtcCAvaG9tZS9lYzItdXNlci9hcHAvbW9kZWxzCmNob3duIC1SIGVjMi11c2VyOmVjMi11c2VyIC9ob21lL2VjMi11c2VyL2FwcAoKY2F0ID4gL2V0Yy9zeXN0ZW1kL3N5c3RlbS9tbC1hdXRvc2NhbGVyLnNlcnZpY2UgPDwgJ0VPRicKW1VuaXRdCkRlc2NyaXB0aW9uPU1MIEF1dG9zY2FsZXIgRmFzdEFQSSBTZXJ2aWNlCkFmdGVyPW5ldHdvcmsudGFyZ2V0IHByb21ldGhldXMuc2VydmljZQoKW1NlcnZpY2VdClVzZXI9ZWMyLXVzZXIKV29ya2luZ0RpcmVjdG9yeT0vaG9tZS9lYzItdXNlci9hcHAKRXhlY1N0YXJ0PS9ob21lL2VjMi11c2VyL2FwcC92ZW52L2Jpbi91dmljb3JuIG1haW46YXBwIC0taG9zdCAwLjAuMC4wIC0tcG9ydCA4MDAwClJlc3RhcnQ9YWx3YXlzClJlc3RhcnRTZWM9MTAKRW52aXJvbm1lbnQ9SE9NRT0vaG9tZS9lYzItdXNlcgoKW0luc3RhbGxdCldhbnRlZEJ5PW11bHRpLXVzZXIudGFyZ2V0CkVPRgoKc3lzdGVtY3RsIGRhZW1vbi1yZWxvYWQKc3lzdGVtY3RsIGVuYWJsZSBtbC1hdXRvc2NhbGVyCnN5c3RlbWN0bCBzdGFydCBtbC1hdXRvc2NhbGVyCgplY2hvICJNYW5hZ2VtZW50IE5vZGUgVXNlckRhdGEgZG9uZSIK"
+      }
+    }
+  },
+  "Outputs": {
+    "FrontendALBDNS": {
+      "Description": "Frontend Load Balancer DNS - use for Locust testing",
+      "Value": {
+        "Fn::Sub": "http://${FrontendALB.DNSName}"
+      }
+    },
+    "BackendALBDNS": {
+      "Description": "Backend Load Balancer DNS",
+      "Value": {
+        "Fn::Sub": "http://${BackendALB.DNSName}"
+      }
+    },
+    "PrometheusURL": {
+      "Description": "Open in browser - verify both ASGs show UP",
+      "Value": {
+        "Fn::Sub": "http://${ManagementNode.PublicIp}:9090/targets"
+      }
+    },
+    "ControllerURL": {
+      "Description": "ML Controller API - verify system is running",
+      "Value": {
+        "Fn::Sub": "http://${ManagementNode.PublicIp}:8000"
+      }
+    },
+    "ManagementNodeIP": {
+      "Description": "SSH into this IP to debug",
+      "Value": {
+        "Fn::GetAtt": [
+          "ManagementNode",
+          "PublicIp"
+        ]
+      }
+    }
+  }
+}
